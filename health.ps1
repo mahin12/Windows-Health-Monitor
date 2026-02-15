@@ -2,18 +2,23 @@
 $ErrorActionPreference = "SilentlyContinue"
 $ProgressPreference    = "SilentlyContinue"
 
+# -----------------------------
+# Config
+# -----------------------------
+$NameFilter = "*"   # example: "*chrome*"
+$MinCPU     = 0     # seconds
+$MinMemory  = 50    # MB
 
-# Event severity weighting config
 $EventHours        = 24
 $EventPenaltyCap   = 35   # max score hit from event logs
 $W_Critical        = 10
 $W_Error           = 3
 $W_Warning         = 1
-$WarnSoftThreshold = 50   # warnings above this count start to matter more
+$WarnSoftThreshold = 50
 
-
-# GPU 
-
+# -----------------------------
+# Functions
+# -----------------------------
 function Get-GPUStatus {
     $gpu = Get-CimInstance Win32_VideoController | Select-Object -First 1 Name, AdapterRAM
     if (-not $gpu) { return $null }
@@ -24,11 +29,11 @@ function Get-GPUStatus {
         if ($raw) {
             $p = $raw -split ',\s*'
             return [PSCustomObject]@{
-                Vendor   = "NVIDIA"
-                Name     = $gpu.Name
-                Temp_C   = [int]$p[0]
-                CoreMHz  = [int]$p[1]
-                MemMHz   = [int]$p[2]
+                Vendor  = "NVIDIA"
+                Name    = $gpu.Name
+                Temp_C  = [int]$p[0]
+                CoreMHz = [int]$p[1]
+                MemMHz  = [int]$p[2]
             }
         }
     }
@@ -56,28 +61,23 @@ function Get-EventSeverityWeightedPenalty {
 
     $start = (Get-Date).AddHours(-1 * $Hours)
 
-    # 1=Critical, 2=Error, 3=Warning (we only care about these)
     $events = foreach ($log in @("System","Application")) {
         Get-WinEvent -FilterHashtable @{ LogName=$log; StartTime=$start; Level=1,2,3 } -ErrorAction SilentlyContinue
     }
-
     $events = @($events)
 
     $crit = @($events | Where-Object { $_.Level -eq 1 }).Count
     $err  = @($events | Where-Object { $_.Level -eq 2 }).Count
     $warn = @($events | Where-Object { $_.Level -eq 3 }).Count
 
-    # Base weighted score
     $raw = ($crit * $W_Critical) + ($err * $W_Error) + ($warn * $W_Warning)
 
-    # Optional: warnings become “louder” after a threshold
     if ($warn -gt $WarnSoftThreshold) {
-        $raw += [math]::Ceiling(($warn - $WarnSoftThreshold) / 25)  # +1 per extra 25 warnings
+        $raw += [math]::Ceiling(($warn - $WarnSoftThreshold) / 25)
     }
 
     $penalty = [math]::Min($raw, $Cap)
 
-    # For diagnosis usefulness (not required)
     $topProviders = ($events |
         Group-Object ProviderName |
         Sort-Object Count -Descending |
@@ -102,9 +102,9 @@ function Get-EventSeverityWeightedPenalty {
     }
 }
 
-
-# System inventory
-
+# -----------------------------
+# Collect data
+# -----------------------------
 $os = Get-CimInstance Win32_OperatingSystem
 $cs = Get-CimInstance Win32_ComputerSystem
 
@@ -118,12 +118,6 @@ $systemInventory = [PSCustomObject]@{
     LastBootTime  = $os.LastBootUpTime
 }
 
-# Process filters (edit anytime)
-
-$NameFilter = "*"   # example: "*chrome*"
-$MinCPU     = 0     # seconds
-$MinMemory  = 50    # MB
-
 $procInfo = Get-Process |
     Where-Object {
         $_.ProcessName -like $NameFilter -and
@@ -136,8 +130,6 @@ $procInfo = Get-Process |
         @{Name="MemoryMB";Expression={[math]::Round($_.WorkingSet/1MB,2)}},
         SI
 
-# Disk space
-
 $diskSpace = Get-PSDrive -PSProvider FileSystem |
     Select-Object Name,
         @{ Name = 'FreeGB';  Expression = { [math]::Round($_.Free / 1GB, 2) } },
@@ -145,12 +137,8 @@ $diskSpace = Get-PSDrive -PSProvider FileSystem |
 
 $lowDisk = $diskSpace | Where-Object { $_.FreeGB -lt 10 }
 
-# Uptime
-
 $uptime     = (Get-Date) - $os.LastBootUpTime
 $uptimeDays = [math]::Round($uptime.TotalDays, 2)
-
-# Failed auto services
 
 $failedServices = Get-Service |
     Where-Object { $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running' } |
@@ -158,11 +146,7 @@ $failedServices = Get-Service |
 
 $failedCount = @($failedServices).Count
 
-# Pending reboot
-
 $rebootPending = [bool](Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
-
-# Health score
 
 $eventWeighted = Get-EventSeverityWeightedPenalty `
     -Hours $EventHours `
@@ -172,17 +156,16 @@ $eventWeighted = Get-EventSeverityWeightedPenalty `
     -W_Warning $W_Warning `
     -WarnSoftThreshold $WarnSoftThreshold
 
+# -----------------------------
+# Score (computed once)
+# -----------------------------
 $score = 100
 if ($uptimeDays -gt 7)       { $score -= 10 }
 if ($failedCount -gt 0)      { $score -= ($failedCount * 5) }
 if ($rebootPending)          { $score -= 15 }
 if (@($lowDisk).Count -gt 0) { $score -= 10 }
-
-# event penalty
 $score -= $eventWeighted.Penalty
-
 if ($score -lt 0) { $score = 0 }
-
 
 $healthSummary = [PSCustomObject]@{
     ComputerName        = $env:COMPUTERNAME
@@ -202,32 +185,10 @@ $healthSummary = [PSCustomObject]@{
     TopEventIds         = $eventWeighted.TopEventIds
 }
 
-
-$score -= $eventWeighted.Penalty
-
-$score = 100
-if ($uptimeDays -gt 7)          { $score -= 10 }
-if ($failedCount -gt 0)         { $score -= ($failedCount * 5) }
-if ($rebootPending)             { $score -= 15 }
-if (@($lowDisk).Count -gt 0)    { $score -= 10 }
-
-# NEW: event severity weighting
-$score -= $eventWeighted.Penalty
-
-if ($score -lt 0) { $score = 0 }
-
-
+# -----------------------------
 # Disk-related events (last 24h)
-
+# -----------------------------
 $startTime = (Get-Date).AddHours(-24)
-
-$eventWeighted = Get-EventSeverityWeightedPenalty `
-    -Hours $EventHours `
-    -Cap $EventPenaltyCap `
-    -W_Critical $W_Critical `
-    -W_Error $W_Error `
-    -W_Warning $W_Warning `
-    -WarnSoftThreshold $WarnSoftThreshold
 
 $diskEvents = Get-WinEvent -FilterHashtable @{
     LogName   = 'System'
@@ -241,8 +202,9 @@ Select-Object -First 200 TimeCreated, ProviderName, Id, LevelDisplayName,
         if ($_.Message) { $_.Message.Substring(0, [Math]::Min(180, $_.Message.Length)) } else { "" }
     }}
 
+# -----------------------------
 # Network test (8.8.8.8)
-
+# -----------------------------
 $testConnection = Test-NetConnection -ComputerName 8.8.8.8 -InformationLevel Detailed
 
 $netResult = [PSCustomObject]@{
@@ -257,19 +219,21 @@ $netResult = [PSCustomObject]@{
     Port             = if ($testConnection.RemotePort -and $testConnection.RemotePort -ne 0) { $testConnection.RemotePort } else { "N/A" }
 }
 
+# -----------------------------
 # GPU status
-
+# -----------------------------
 $gpuStatus = Get-GPUStatus
 
-# Report
-
-$healthText = $healthSummary     | Format-Table | Out-String
-$invText    = $systemInventory   | Format-List            | Out-String
+# -----------------------------
+# Report (avoid table wrapping on wide objects)
+# -----------------------------
+$healthText = $healthSummary     | Format-List | Out-String
+$invText    = $systemInventory   | Format-List | Out-String
 $diskText   = $diskSpace         | Format-Table -AutoSize | Out-String
 $failText   = if ($failedCount -gt 0) { $failedServices | Format-Table -AutoSize | Out-String } else { "None`n" }
 $procText   = $procInfo          | Format-Table -AutoSize | Out-String
 $eventsText = if (@($diskEvents).Count -gt 0) { $diskEvents | Format-Table -Wrap -AutoSize | Out-String } else { "No disk-related events found in the last 24 hours.`n" }
-$netText    = $netResult         | Format-List            | Out-String
+$netText    = $netResult         | Format-List | Out-String
 $gpuText    = if ($gpuStatus)    { $gpuStatus | Format-List | Out-String } else { "No GPU detected.`n" }
 
 $final = @"
