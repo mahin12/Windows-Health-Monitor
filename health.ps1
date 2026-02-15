@@ -135,9 +135,25 @@ if (@($diskEvents).Count -gt 0) {
     Write-Host "No disk-related events found in the last 24 hours."
 }
 
-Write-Host "`nDone.`n"
+
 
 # Test connection to a host (e.g., google.com)
 
-Test-NetConnection -ComputerName 8.8.8.8 -InformationLevel Detailed
+$testConnection = Test-NetConnection -ComputerName 8.8.8.8 -InformationLevel Detailed
 
+$result = [PSCustomObject]@{
+    Target = $testConnection.RemoteAddress
+    Hostname = ($testConnection.NameResolutionResults -join ", ")
+    Interface = $test.InterfaceAlias
+    SourceIP = $testConnection.SourceAddress
+    Gateway = $testConnection.NetRoute.NextHop
+    PingStatus = if ($testConnection.PingSucceeded) { "Success" } else { "Failed" }
+    Latency_ms = $testConnection.PingReplyDetails.RoundTripTime
+    Port = $testConnection.RemotePort
+    TcpTestSucceeded = $testConnection.TcpTestSucceeded
+}
+
+$result | Format-List
+
+
+Write-Host "`nDone.`n"
