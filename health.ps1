@@ -26,7 +26,8 @@ $EventHours        = 24
 $W_Critical        = 10
 $W_Error           = 3
 $W_Warning         = 1
-$WarnSoftThreshold = 50  # warnings above this start adding extra penalty
+$WarnSoftThreshold = 50  
+# warnings above this start adding extra penalty
 
 # Disk thresholds
 $DiskHardFreeGB    = 10    # <10GB free = extra penalty
@@ -408,3 +409,28 @@ Done.
 
 
 Write-Output $final
+
+#Export report (txt and csv for now, will add json later)
+
+$folder = "C:\Reports"
+
+#create folder if not exists
+if (-not (Test-Path $folder)) {
+    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+}
+
+#timestamps
+$timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+
+#filepaths
+
+$txtPath = "$folder\WindowsHealthReport_$timestamp.txt"
+$csvPath = "$folder\WindowsHealthReport_$timestamp.csv"
+
+#txt = full report, csv = summary
+$final | Out-File -FilePath $txtPath -Encoding utf8 -Force
+$healthSummary | Export-Csv -Path $csvPath -NoTypeInformation
+
+Write-Host "Reports generated:"
+Write-Host " - $txtPath"
+Write-Host " - $csvPath"
