@@ -1,24 +1,55 @@
-# Windows Health Monitor
+# Windows Health Monitor 
 $ErrorActionPreference = "SilentlyContinue"
 $ProgressPreference    = "SilentlyContinue"
 
-# -----------------------------
 # Config
-# -----------------------------
-$NameFilter = "*"   # example: "*chrome*"
-$MinCPU     = 0     # seconds
-$MinMemory  = 50    # MB
+
+$NameFilter = "*"
+$MinCPU     = 0
+$MinMemory  = 50
+
+# Scoring caps (max penalty per category)
+
+$CAP = @{
+    Events        = 35
+    Services      = 20
+    Disk          = 25
+    Network       = 15
+    Uptime        = 10
+    PendingReboot = 15
+    GPU           = 10
+}
+
+# Event weights
 
 $EventHours        = 24
-$EventPenaltyCap   = 35   # max score hit from event logs
 $W_Critical        = 10
 $W_Error           = 3
 $W_Warning         = 1
-$WarnSoftThreshold = 50
+$WarnSoftThreshold = 50  # warnings above this start adding extra penalty
 
-# -----------------------------
-# Functions
-# -----------------------------
+# Disk thresholds
+$DiskHardFreeGB    = 10    # <10GB free = extra penalty
+$DiskWarnPctFree   = 15    # <15% free starts hurting
+$DiskCritPctFree   = 8     # <8% free hurts a lot
+
+# Network thresholds
+$LatencyWarnMs     = 50
+$LatencyCritMs     = 120
+
+# Uptime thresholds
+$UptimeGraceDays   = 7     # no penalty up to 7 days
+$UptimeMaxDays     = 30    # max penalty by 30 days
+
+
+# Helpers
+
+function Clamp([double]$value, [double]$min, [double]$max) {
+    if ($value -lt $min) { return $min }
+    if ($value -gt $max) { return $max }
+    return $value
+}
+
 function Get-GPUStatus {
     $gpu = Get-CimInstance Win32_VideoController | Select-Object -First 1 Name, AdapterRAM
     if (-not $gpu) { return $null }
@@ -39,9 +70,7 @@ function Get-GPUStatus {
     }
 
     [PSCustomObject]@{
-        Vendor  = if ($gpu.Name -match "AMD|Radeon") { "AMD" }
-                  elseif ($gpu.Name -match "Intel") { "Intel" }
-                  else { "Unknown" }
+        Vendor  = if ($gpu.Name -match "AMD|Radeon") { "AMD" } elseif ($gpu.Name -match "Intel") { "Intel" } else { "Unknown" }
         Name    = $gpu.Name
         Temp_C  = "N/A"
         CoreMHz = "N/A"
@@ -102,9 +131,9 @@ function Get-EventSeverityWeightedPenalty {
     }
 }
 
-# -----------------------------
+
 # Collect data
-# -----------------------------
+
 $os = Get-CimInstance Win32_OperatingSystem
 $cs = Get-CimInstance Win32_ComputerSystem
 
@@ -135,61 +164,158 @@ $diskSpace = Get-PSDrive -PSProvider FileSystem |
         @{ Name = 'FreeGB';  Expression = { [math]::Round($_.Free / 1GB, 2) } },
         @{ Name = 'TotalGB'; Expression = { [math]::Round(($_.Used + $_.Free) / 1GB, 2) } }
 
-$lowDisk = $diskSpace | Where-Object { $_.FreeGB -lt 10 }
-
 $uptime     = (Get-Date) - $os.LastBootUpTime
 $uptimeDays = [math]::Round($uptime.TotalDays, 2)
 
 $failedServices = Get-Service |
     Where-Object { $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running' } |
     Select-Object Name, DisplayName, Status, StartType
-
 $failedCount = @($failedServices).Count
 
 $rebootPending = [bool](Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
 
 $eventWeighted = Get-EventSeverityWeightedPenalty `
     -Hours $EventHours `
-    -Cap $EventPenaltyCap `
+    -Cap $CAP.Events `
     -W_Critical $W_Critical `
     -W_Error $W_Error `
     -W_Warning $W_Warning `
     -WarnSoftThreshold $WarnSoftThreshold
 
-# -----------------------------
-# Score (computed once)
-# -----------------------------
-$score = 100
-if ($uptimeDays -gt 7)       { $score -= 10 }
-if ($failedCount -gt 0)      { $score -= ($failedCount * 5) }
-if ($rebootPending)          { $score -= 15 }
-if (@($lowDisk).Count -gt 0) { $score -= 10 }
-$score -= $eventWeighted.Penalty
-if ($score -lt 0) { $score = 0 }
+$testConnection = Test-NetConnection -ComputerName 8.8.8.8 -InformationLevel Detailed
 
-$healthSummary = [PSCustomObject]@{
-    ComputerName        = $env:COMPUTERNAME
-    HealthScore         = $score
-    Uptime              = $uptime.ToString()
-    UptimeDays          = $uptimeDays
-    PendingReboot       = $rebootPending
-    FailedServices      = $failedCount
-    LowDisk             = (@($lowDisk).Count -gt 0)
-    LowDiskDrives       = (@($lowDisk).Name -join ', ')
-    EventWindowHours    = $eventWeighted.WindowHours
-    EventCriticalCount  = $eventWeighted.CriticalCount
-    EventErrorCount     = $eventWeighted.ErrorCount
-    EventWarningCount   = $eventWeighted.WarningCount
-    EventPenaltyApplied = $eventWeighted.Penalty
-    TopEventProviders   = $eventWeighted.TopProviders
-    TopEventIds         = $eventWeighted.TopEventIds
+$netResult = [PSCustomObject]@{
+    Target      = $testConnection.RemoteAddress.IPAddressToString
+    SourceIP    = $testConnection.SourceAddress.IPAddressToString
+    Gateway     = $testConnection.NetRoute.NextHop.IPAddressToString
+    PingOK      = [bool]$testConnection.PingSucceeded
+    Latency_ms  = $testConnection.PingReplyDetails.RoundTripTime
 }
 
-# -----------------------------
-# Disk-related events (last 24h)
-# -----------------------------
-$startTime = (Get-Date).AddHours(-24)
+$gpuStatus = Get-GPUStatus
 
+
+# Scoring (extensive)
+
+$pen = [ordered]@{
+    PendingReboot = 0
+    Uptime        = 0
+    Services      = 0
+    Disk          = 0
+    Events        = 0
+    Network       = 0
+    GPU           = 0
+}
+
+$reasons = New-Object System.Collections.Generic.List[string]
+
+# Pending reboot
+
+if ($rebootPending) {
+    $pen.PendingReboot = $CAP.PendingReboot
+    $reasons.Add("Pending reboot detected (-$($pen.PendingReboot))")
+}
+
+# Uptime (gradual after grace)
+if ($uptimeDays -gt $UptimeGraceDays) {
+    $t = ($uptimeDays - $UptimeGraceDays) / ([math]::Max(1, ($UptimeMaxDays - $UptimeGraceDays)))
+    $pen.Uptime = [math]::Round((Clamp $t 0 1) * $CAP.Uptime, 0)
+    if ($pen.Uptime -gt 0) { $reasons.Add("High uptime: $uptimeDays days (-$($pen.Uptime))") }
+}
+
+# Services (scaled)
+if ($failedCount -gt 0) {
+    # 1-2 failed: mild, 3-5 moderate, 6+ heavy; capped
+    $raw = 0
+    if ($failedCount -le 2) { $raw = 4 * $failedCount }
+    elseif ($failedCount -le 5) { $raw = 8 + (3 * ($failedCount - 2)) }
+    else { $raw = 17 + (1 * ($failedCount - 5)) }
+
+    $pen.Services = [int](Clamp $raw 0 $CAP.Services)
+    $reasons.Add("Automatic services not running: $failedCount (-$($pen.Services))")
+}
+
+# Disk (evaluate worst drive)
+
+$worst = $null
+foreach ($d in $diskSpace) {
+    if ($d.TotalGB -le 0) { continue }
+    $pctFree = [math]::Round((($d.FreeGB / $d.TotalGB) * 100), 2)
+
+    $drivePenalty = 0
+
+    # % free penalty curve
+    if ($pctFree -lt $DiskCritPctFree) {
+        $drivePenalty += 18
+    } elseif ($pctFree -lt $DiskWarnPctFree) {
+        $drivePenalty += 10
+    }
+
+    # absolute free GB penalty
+    if ($d.FreeGB -lt $DiskHardFreeGB) {
+        $drivePenalty += 10
+    }
+
+    if (-not $worst -or $drivePenalty -gt $worst.Penalty) {
+        $worst = [PSCustomObject]@{
+            Name     = $d.Name
+            FreeGB   = $d.FreeGB
+            TotalGB  = $d.TotalGB
+            PctFree  = $pctFree
+            Penalty  = $drivePenalty
+        }
+    }
+}
+
+if ($worst -and $worst.Penalty -gt 0) {
+    $pen.Disk = [int](Clamp $worst.Penalty 0 $CAP.Disk)
+    $reasons.Add("Low disk on $($worst.Name): $($worst.FreeGB)GB free ($($worst.PctFree)% free) (-$($pen.Disk))")
+}
+
+# Events (already capped inside function)
+
+$pen.Events = [int](Clamp $eventWeighted.Penalty 0 $CAP.Events)
+if ($pen.Events -gt 0) {
+    $reasons.Add("Event severity (last $EventHours h): C$($eventWeighted.CriticalCount)/E$($eventWeighted.ErrorCount)/W$($eventWeighted.WarningCount) (-$($pen.Events))")
+}
+
+# Network
+
+if (-not $netResult.PingOK) {
+    $pen.Network = $CAP.Network
+    $reasons.Add("Network ping to 8.8.8.8 failed (-$($pen.Network))")
+} else {
+    $lat = [double]$netResult.Latency_ms
+    $netPen = 0
+    if ($lat -ge $LatencyCritMs) { $netPen = 10 }
+    elseif ($lat -ge $LatencyWarnMs) { $netPen = 5 }
+
+    $pen.Network = [int](Clamp $netPen 0 $CAP.Network)
+    if ($pen.Network -gt 0) { $reasons.Add("High latency to 8.8.8.8: ${lat}ms (-$($pen.Network))") }
+}
+
+# GPU (only score if we have a numeric temp)
+
+if ($gpuStatus -and $gpuStatus.Temp_C -is [int]) {
+    $t = [int]$gpuStatus.Temp_C
+    $gpuPen = 0
+    if ($t -ge 90) { $gpuPen = 10 }
+    elseif ($t -ge 80) { $gpuPen = 6 }
+    elseif ($t -ge 75) { $gpuPen = 3 }
+
+    $pen.GPU = [int](Clamp $gpuPen 0 $CAP.GPU)
+    if ($pen.GPU -gt 0) { $reasons.Add("High GPU temp: ${t}C (-$($pen.GPU))") }
+}
+
+# Final score
+
+$totalPenalty = ($pen.Values | Measure-Object -Sum).Sum
+$score = [int](Clamp (100 - $totalPenalty) 0 100)
+
+
+# Disk-related events (last 24h)
+
+$startTime = (Get-Date).AddHours(-24)
 $diskEvents = Get-WinEvent -FilterHashtable @{
     LogName   = 'System'
     StartTime = $startTime
@@ -202,39 +328,54 @@ Select-Object -First 200 TimeCreated, ProviderName, Id, LevelDisplayName,
         if ($_.Message) { $_.Message.Substring(0, [Math]::Min(180, $_.Message.Length)) } else { "" }
     }}
 
-# -----------------------------
-# Network test (8.8.8.8)
-# -----------------------------
-$testConnection = Test-NetConnection -ComputerName 8.8.8.8 -InformationLevel Detailed
 
-$netResult = [PSCustomObject]@{
-    Target           = $testConnection.RemoteAddress.IPAddressToString
-    Hostname         = if ($testConnection.NameResolutionResults) { $testConnection.NameResolutionResults -join ", " } else { "N/A" }
-    Interface        = if ($testConnection.InterfaceAlias) { $testConnection.InterfaceAlias } else { "N/A" }
-    SourceIP         = $testConnection.SourceAddress.IPAddressToString
-    Gateway          = $testConnection.NetRoute.NextHop.IPAddressToString
-    PingStatus       = if ($testConnection.PingSucceeded) { "Success" } else { "Failed" }
-    Latency_ms       = $testConnection.PingReplyDetails.RoundTripTime
-    TcpTestSucceeded = $testConnection.TcpTestSucceeded
-    Port             = if ($testConnection.RemotePort -and $testConnection.RemotePort -ne 0) { $testConnection.RemotePort } else { "N/A" }
+# Summary objects
+
+$healthSummary = [PSCustomObject]@{
+    ComputerName   = $env:COMPUTERNAME
+    HealthScore    = $score
+    TotalPenalty   = $totalPenalty
+    Uptime         = $uptime.ToString()
+    UptimeDays     = $uptimeDays
+    PendingReboot  = $rebootPending
+    FailedServices = $failedCount
+    EventsWindowH  = $eventWeighted.WindowHours
+    Events_C       = $eventWeighted.CriticalCount
+    Events_E       = $eventWeighted.ErrorCount
+    Events_W       = $eventWeighted.WarningCount
+    EventsPenalty  = $pen.Events
+    DiskWorstDrive = if ($worst) { $worst.Name } else { "N/A" }
+    DiskPenalty    = $pen.Disk
+    NetworkPenalty = $pen.Network
+    ServicesPenalty= $pen.Services
+    UptimePenalty  = $pen.Uptime
+    RebootPenalty  = $pen.PendingReboot
+    GPUPenalty     = $pen.GPU
 }
 
-# -----------------------------
-# GPU status
-# -----------------------------
-$gpuStatus = Get-GPUStatus
+$penaltyBreakdown = [PSCustomObject]$pen
 
-# -----------------------------
-# Report (avoid table wrapping on wide objects)
-# -----------------------------
-$healthText = $healthSummary     | Format-List | Out-String
-$invText    = $systemInventory   | Format-List | Out-String
-$diskText   = $diskSpace         | Format-Table -AutoSize | Out-String
-$failText   = if ($failedCount -gt 0) { $failedServices | Format-Table -AutoSize | Out-String } else { "None`n" }
-$procText   = $procInfo          | Format-Table -AutoSize | Out-String
-$eventsText = if (@($diskEvents).Count -gt 0) { $diskEvents | Format-Table -Wrap -AutoSize | Out-String } else { "No disk-related events found in the last 24 hours.`n" }
-$netText    = $netResult         | Format-List | Out-String
-$gpuText    = if ($gpuStatus)    { $gpuStatus | Format-List | Out-String } else { "No GPU detected.`n" }
+$netDetail = [PSCustomObject]@{
+    Target     = "8.8.8.8"
+    PingStatus = if ($netResult.PingOK) { "Success" } else { "Failed" }
+    Latency_ms = $netResult.Latency_ms
+    SourceIP   = $netResult.SourceIP
+    Gateway    = $netResult.Gateway
+}
+
+
+# Report (print once, readable)
+
+$healthText   = $healthSummary      | Format-List | Out-String
+$penText      = $penaltyBreakdown   | Format-List | Out-String
+$whyText      = if ($reasons.Count -gt 0) { ($reasons | Select-Object -First 10 | ForEach-Object { " - $_" }) -join "`n" } else { " - No issues detected." }
+$invText      = $systemInventory    | Format-List | Out-String
+$diskText     = $diskSpace          | Format-Table -AutoSize | Out-String
+$failText     = if ($failedCount -gt 0) { $failedServices | Format-Table -AutoSize | Out-String } else { "None`n" }
+$procText     = $procInfo           | Format-Table -AutoSize | Out-String
+$eventsText   = if (@($diskEvents).Count -gt 0) { $diskEvents | Format-Table -Wrap -AutoSize | Out-String } else { "No disk-related events found in the last 24 hours.`n" }
+$netText      = $netDetail          | Format-List | Out-String
+$gpuText      = if ($gpuStatus) { $gpuStatus | Format-List | Out-String } else { "No GPU detected.`n" }
 
 $final = @"
 ===============================
@@ -243,6 +384,11 @@ $final = @"
 
 === HEALTH SUMMARY ===
 $healthText
+=== PENALTY BREAKDOWN ===
+$penText
+=== TOP ISSUES ===
+$whyText
+
 === SYSTEM INVENTORY ===
 $invText
 === DISK SPACE ===
@@ -259,5 +405,6 @@ $netText
 $gpuText
 Done.
 "@
+
 
 Write-Output $final
